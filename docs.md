@@ -1,1 +1,112 @@
-tba
+# Technische Analyse von `raw13g.github.io-main`
+
+**Stand der Analyse:** 5. Oktober 2026  
+**Quelle:** vom Nutzer bereitgestelltes ZIP; SHA-256 des Archivs `e063c7d15fa1f919580a8c7f432cb1a999c9b2b5feef99cd0f4f063da722d48a`.  
+**Methode:** statische Auswertung des enthaltenen JavaScript, HTML, Cache-Manifests und der Metadaten der Binärdateien. Kein Konsolenversuch, keine Ausführung der Exploitkette, kein unabhängiger Kernel-Dump-Abgleich.  
+**Zielgruppe:** fortgeschrittene Ausbildung und Forschung in System- und Kernel-Sicherheit. Die Berufs- und Ausbildungsangaben der Zielgruppe sind Selbstauskünfte, keine technische Voraussetzung des Codes.
+
+## 1. Worum es sich handelt
+
+Das Repository ist eine PS4-Webseite, die nach dem Laden selbstständig eine mehrstufige Jailbreak-Kette versucht. Sie beginnt mit einem JavaScriptCore/WebKit-Speicherfehler, erzeugt daraus einen Browserprozess-Speicherzugriff, benutzt diesen für native Funktionsaufrufe und Syscalls und greift anschließend eine Race Condition im Kernelpfad um asynchrone I/O-Operationen an. Ein zunächst sehr eingeschränkter Kernel-Messkanal wird zu einer Kerneladresse und später zu einer über `sysctl` erreichbaren Kernel-Lese-/Schreibfunktion ausgebaut. Optional verändert der Code Prozess-Credentials und Jail-Bezüge, führt einen Kernel-Patch-Blob aus und startet eine mitgelieferte Payload in einem Thread. Das ist die **beabsichtigte und aus dem Code rekonstruierbare Funktion**, keine hier unabhängig nachgewiesene Erfolgsrate. [S: `jb.js:150–3867`, `core.js:665–1414`]
+
+Die zwei entscheidenden Privilegübergänge sind: (1) JavaScript zu Speicherzugriff und nativen Aufrufen **im Browserprozess** und (2) ein Kernel-Race, dessen Seiteneffekte in Kernelobjekten beobachtet und später zur Umleitung eines Kernel-Datenpfads verwendet werden. Ein erfolgreicher `getpid`-Aufruf durch die native Kette zeigt lediglich, dass ein Syscall erreicht wird; er beweist noch keine Kernel-Speicherkontrolle. Der Code prüft diese Fähigkeit erst in späteren Phasen. [S: `jb.js:441–642`, `jb.js:2789–2948`]
+
+## 2. Dateien und Verantwortlichkeiten
+
+| Datei | Rolle | Relevante Stellen |
+| --- | --- | --- |
+| `index.html` | Firmwareanzeige, Offline-Cache-Zustand, Weiterleitung auf `jb.html` | `index.html:34–136` |
+| `jb.html` | Oberfläche mit Spinner, Ergebnis und optionalem ausführlichem Log; importiert `jb.js` | `jb.html`, Modulimport am Ende |
+| `core.js` | WebKit/JSC-Vorstufe: Adressgewinnung, Grooming, gefälschte Zelle, geprüfter Speicherträger | `core.js:570–1414` |
+| `mem.js` | API für Browserprozess-Speicherzugriff (`read1/2/4/8`, `write1/2/4/8`, `leakval`) und optionale Träger-Promotion | `mem.js:12–219`, `344–908` |
+| `int64.js` | Paar aus zwei 32-Bit-Wörtern für 64-Bit-Adressen und kleine Arithmetik | gesamte Datei |
+| `ps4_offsets.js` | Firmwareprofile, WebKit-/libkernel-/Kernel-RVAs, Dateinamen und Profilstatus | `ps4_offsets.js:1–655` |
+| `rpc_worker.js` | Nachrichten-RPC, eigener Speicherzugriff und native Aufrufe in zwei Workern | `rpc_worker.js:1–215` |
+| `jb.js` | Gesamtorchestrierung: Gates, Worker, Race, Orakel, Kernel-R/W, Jailbreak, Patch, Payload, Cleanup | `jb.js:1–3867` |
+| `cache.appcache` | Veralteter Application-Cache-Mechanismus zur Offlinebereitstellung; SHA-256-Werte stehen in Kommentaren | gesamte Datei |
+| `patches/*.bin` | kleine, firmwarebezogene ausführbare Patch-Blobs | Binärdateien; JavaScript lädt sie in `jb.js:2992–3017, 3321–3448` |
+| `payload2.bin`, `goldhen.bin` | größere Payload-Dateien; im Archiv byteidentisch | `jb.js:3021–3045, 3473–3559` |
+
+Das Archiv enthält **keine** Quellen für die drei Patch-Blobs und **keinen** passenden Kernel-Dump. Die Strings `tools/kderive.py`, `kdump5.html` und `patches/1300.c` im JavaScript verweisen auf Dateien, die in diesem ZIP fehlen. Die tatsächliche interne Logik der Binärdateien lässt sich aus dem JavaScript allein nicht vollständig dokumentieren. [S: `jb.js:184–225`, Archivinhalt]
+
+## 3. Start, Firmwareauswahl und Zustände
+
+1. `index.html` interpretiert den PS4-User-Agent. Die Minor-Version wird als Hexadezimalziffern gelesen und zum Profilschlüssel wie `13.52` normalisiert. Eine kurze `SUPPORTED`-Liste steuert nur die automatische Weiterleitung. Bei unbekanntem Eintrag kann eine Nutzereingabe trotzdem `jb.html` öffnen. `force=1` ändert diese UI-Entscheidung, fügt aber keine fehlenden Offsets hinzu. [S: `index.html:40–83`]
+2. Der Application Cache bestimmt, ob sofort weitergeleitet, ein erster Offline-Cache abgewartet oder nach einem Update neu geladen wird. `jb.html` importiert `jb.js`; dessen asynchrone, sofort aufgerufene Funktion beginnt ohne weiteren Startknopf. [S: `index.html:86–136`, `jb.js:150`]
+3. `offsetsFor()` wählt das Profil nach demselben UA-Schema. `jb.js` prüft zuerst, ob die für die aktuelle Kernelkette nötigen Tabellenfelder vorliegen, dann abhängig von den aktivierten Endphasen auch Patch- und Payload-Felder. Bei einem fehlenden Gate endet die Funktion vor dem Browser-Speicherprimitive. [S: `ps4_offsets.js:647–655`, `jb.js:156–232`]
+4. Die Hauptschalter `jb`, `patch`, `payload` und `skipjb` sind standardmäßig aktiviert. `skipjb` prüft später, ob ein bereits modifiziertes System einen bestimmten Privilegtest besteht; bei positivem Ergebnis wird die Kernel-Race-Phase übersprungen und gegebenenfalls nur die Payload neu gestartet. `jb=0` lässt die späteren Patch- und Payload-Bedingungen in diesem normalen Endpfad unerfüllt. [S: `jb.js:165–170, 543–642, 3070–3473`]
+
+Die Profile unterscheiden **vorhandene Tabelleneinträge**, **im ZIP vorhandene Blobs** und **Behauptungen über Hardwaretests**. Die Landingpage nennt `13.02`, `13.04`, `13.50`, `13.52`. Die Tabelle enthält zusätzlich `11.00`, `11.50`, `12.00`, `12.02`, `12.50`, `12.52` und `13.00`; mehrere davon verweisen auf hier fehlende Patch- oder Payload-Dateien. `13.04` teilt Browserwerte mit `13.00` und Kernelwerte beziehungsweise Blob mit `13.02`; `13.52` übernimmt Browser-/libkernel-Werte von `13.50`, überschreibt aber Kernelwerte und Dateinamen. Ein Alias bedeutet daher nicht, dass alle Kerneladressen identisch sind. [S: `index.html:42–47`, `ps4_offsets.js:45–645`]
+
+## 4. Browserprimitive: von Objektlayout zu adressierbarem Speicher
+
+`core.js` bereitet mehrere absichtlich unterscheidbare Objekte vor: einen getypten Byte-View als möglichen Speicherträger, einen Objekt-Holder mit Referenzen auf eine native JavaScript-Funktion, ein DOM-Element und Markerobjekte. Ein spezieller Proxy-/`super`-Zugriff in `leakScopeObject()` liefert einen Scope-bezogenen Empfänger; die daraus abgeleitete Wrapper- und String-Operation wird benutzt, um wiederholte Zeigerrepräsentationen aus einem großen Träger zu lesen. Die Werte werden auf plausible, unterschiedliche und wiederholte Adressen geprüft. Das sind implementierungsabhängige Annahmen über JavaScriptCore und seinen Objektaufbau. [S: `core.js:570–753, 1150–1234`]
+
+Danach legt `buildAndStoreGraph()` einen großen strukturierten Graphen in `history.replaceState` ab. `runGroomAndLoad()` erzeugt und löst ArrayBuffer-Allokationen mit `MessageChannel`-Transfers, platziert kontrollierte Bytes in einem benachbarten Puffer und liest `history.state` wieder. Der Code unterscheidet einen normalen Clone vom unerwarteten Kandidaten an einem duplizierten Index. Der erwartete Fehlerzustand wird als getypter View beziehungsweise gefälschte Zelle interpretiert. Eine solche Interpretation ist nur dann belastbar, wenn die nachfolgenden Layout- und Identitätstests bestehen; der Quelltext allein beweist nicht, warum eine bestimmte Firmware diesen Zustand erzeugt. [S: `core.js:665–687, 758–844, 1071–1235`]
+
+`loadHistoryCritical()` liest den Kandidatenheader, kontrolliert unter anderem Struktur-ID, Vektor, Länge, Typfelder und Zeigerform, und testet das Zielen des Trägers an einem identifizierbaren Objekt. Danach werden Holder-, Funktions- und Native-Executable-Strukturen mehrfach gelesen und auf Konsistenz geprüft. Der Träger wird nach einer Probe wieder auf seinen ursprünglichen Vektor gesetzt. Nur wenn die Prüfungen und die beobachtete Rückstellung gelingen, gibt `establishPrimitive()` über `buildCarrier()` ein Objekt mit `aim`, `restore`, `view` und einem Leak-Slot zurück. Einige Fehlschläge lösen erneute Versuche aus; nach einer unsicheren Mutation werden weitere Versuche dagegen unterdrückt. [S: `core.js:758–1068, 1236–1462`]
+
+`mem.js` kapselt diesen Träger in typisierte Lese- und Schreibfunktionen. Jeder Zugriff richtet den kurzen View auf eine Adresse, liest oder schreibt little endian und stellt ihn im `finally`-Block zurück. `leakval()` legt eine Objektref im Holder ab und liest den zugehörigen Zellwert. Der optionale Umbau zu einem echten Paar von Views (`promoteToRealPair`) ist implementiert, wird hier aber ausdrücklich mit `{ promote: false }` nicht ausgeführt. Der ursprüngliche große Träger bleibt damit am Leben. Die Adressprüfung in `mem.js` ist eine Plausibilitätsprüfung für den **Browseradressraum**, keine Kernel-Zugriffskontrolle. [S: `mem.js:12–219, 444–908`, `jb.js:302–325`]
+
+## 5. Native Aufrufe aus dem Browserprozess
+
+Aus einer bekannten nativen JavaScript-Funktion und den Firmware-RVAs leitet `jb.js` die Basen von WebKit und libkernel ab. Vor der weiteren Verwendung prüft es Modul-Ausrichtung, Bytes an den benötigten Gadgetstellen und Form sowie Nummer vorhandener Syscall-Stubs. Dieser Abgleich schützt gegen einen Teil falscher Tabellen, ist aber keine Signaturprüfung des gesamten Moduls. [S: `jb.js:328–440`]
+
+Der Browser-Teil baut anschließend einen kleinen Aufrufkontext in ArrayBuffers. `layout()` legt Argumente, Ziel, Rückgabespeicherung und Rückweg ab. `makeCtx()` hält dazu einen Speicher- und Pivot-Kontext vor. Der Eintrag einer nativen JavaScript-Funktion wird zeitweilig auf eine vorbereitete Sequenz umgelenkt; ein Aufruf der Funktion triggert die Kette. `callAddr()` liest das native Ergebnis aus dem Frame, und `sc()` wählt als Ziel einen libkernel-Syscall-Stub. Der Code testet den Mechanismus mit einem Prozess-ID-Syscall. **Diese Stufe ist Userland-Ausführung im Browserprozess.** [S: `jb.js:441–539, 626–642`]
+
+Zwei `Worker` erhalten jeweils einen eigenen RPC-Kanal und einen eigenen vorbereiteten Aufrufkontext. Der Hauptthread identifiziert ihre getypten Speicherobjekte anhand ihrer Form, verbindet den jeweiligen Worker-View mit einem steuerbaren Metadatenbereich und lässt `rpc_worker.js` seine native Funktionsreferenz selbst umleiten. So können die Worker Syscalls auf ihren eigenen Threads auslösen, während der Hauptthread Datenbereiche beobachtet und verändert. Ein Worker-Prozess ist hier nicht gemeint: Es sind JavaScript-Worker mit eigenen Threads innerhalb des Browserkontexts. [S: `jb.js:662–806`, `rpc_worker.js:55–215`]
+
+## 6. Kernel-Race: welche Eigenschaft ausgenutzt wird
+
+Das Kernelziel ist der Umgang mit asynchronen I/O-Anfragen bei Wait, Cancel, Poll und Delete. Der Code kombiniert viele offene Sockets, ein umgebendes AIO-Setup, kontrollierte IPv6-Routing-Header und zwei Worker. Die Größen von AIO- und IPv6-Objekten sollen in dieselbe Kernel-Allocator-Größenklasse fallen. Hauptthread und Worker werden auf getrennte, zuvor überprüfte CPU-Kerne gelegt; diese Zuordnung soll die Reihenfolge von Freigabe, Wiederbelegung und konkurrierendem Kernel-Walk stabilisieren. [S: `jb.js:695–1209`]
+
+`armOnce()` beseitigt zunächst Routing-Header aus dem Socket-Pool, reicht AIO-Anfragen ein, lässt einen kurzen Wait laufen und belegt die freigewordene Größenklasse erneut mit kontrollierten Routing-Headern. `leakCurthread()` lässt einen Worker parallel einen Cancel-Pfad durchlaufen und beobachtet einen Speicherbereich, in dem der Kernel nach der beabsichtigten Fehlzuordnung schreiben soll. Bei wiederholt konsistentem, wie ein Kernelzeiger geformtem Wert wird dieser als Zeiger auf eine Threadstruktur interpretiert. Danach versucht der Code, ausstehende Requests aufzuräumen oder den betroffenen Worker zu parken. Ein fehlender oder uneindeutiger Leak führt zum Abbruch beziehungsweise zu einer nur in dieser frühen Lesephase vorgesehenen Neuauflage. [S: `jb.js:1218–1514`]
+
+Die spätere Funktion `runChain()` verarbeitet eine vom Hauptthread gefüllte Folge von Datenknoten. Bei erfolgreicher Fehlzuordnung führt ein Kernelpfad aus diesen Knoten einen begrenzten **Dekrement-Seiteneffekt** aus. Der Quelltext überprüft die Wirkung über Zähler in kontrollierten Puffern und einen Socketzustand. Erst `fireOk()` erlaubt die Interpretation einer Messung, wenn sowohl der Anfangsknoten als auch ein Trägersocket beobachtet wurden. Das ist zu diesem Zeitpunkt weder ein unmittelbares Lesen beliebiger Kernelbytes noch ein allgemeiner Schreibaufruf; beides wird aus zahlreichen Messungen und gezielten Strukturänderungen abgeleitet. [S: `jb.js:1552–1769`]
+
+## 7. Von Seiteneffekten zu Informationen
+
+Die erste Orakelphase bestimmt schrittweise den unteren Teil eines `td_ucred`-Zeigers eines Workers. Sie beobachtet, bei welcher Zahl wiederholter Dekremente ein signierter Zähler eine Grenze überschreitet. Eine zweite Phase verfeinert das Ergebnis. Das obere Wort wird aus dem zuvor beobachteten `curthread`-Zeiger übernommen; genau diese Gleichheit des oberen Adressbereichs ist eine **Annahme** des Codes. Später vergleicht der Endpfad den erhaltenen Wert mit dem aus `curproc` gelesenen echten Credential-Zeiger und versucht, eine etwaige Änderung am Workerfeld vor dem Prozessende zu reparieren. [S: `jb.js:1771–1965, 3074–3122, 3564–3581`]
+
+Ein weiteres Orakel untersucht bekannte, reservierte IDT-Einträge. Es vergleicht einen beobachteten Folge-Zähler mit simulierten Mustern möglicher Bytewerte, verlangt eindeutige Kandidaten, prüft zwei Kontrollwerte und wiederholt zwei Byteproben. Aus den dekodierten Bestandteilen eines Handlerzeigers und einer Firmware-RVA errechnet es eine Kernelbasis und prüft deren Ausrichtung. Das ist eine **Kernelbasis-Inferenz mit Konsistenzgates**, kein direkter Kernel-Dump. Anschließend prüft ein weiteres Orakel an einer erwarteten `sysctl`-OID-Struktur eine bekannte Nummer, bevor diese Basis für Schreibphasen genutzt wird. [S: `jb.js:1970–2342, 2558–2630`]
+
+## 8. Übergang zur allgemeinen Kernel-Lese-/Schreibfunktion
+
+Zuerst manipuliert der Code ein Berechtigungsbit in der eigenen Credential-Struktur und die Sichtbarkeit einer Kernel-`sysctl`-OID. Ein Syscall fragt dann ab, ob die zuvor versteckte OID erreichbar ist. Die darauf folgende Strukturänderung betrifft OIDs, deren `arg1`-Zeiger auf Werte anderer OIDs umgelenkt werden sollen. Dadurch wird ein sonst fest gebundener `sysctl`-Datenzugriff in einen durch weitere `sysctl`-Operationen steuerbaren Zugriff verwandelt. Diese Stufe setzt voraus, dass die Firmware-RVAs, die Kernelstruktur, die geänderten Berechtigungen und die vorherigen Messungen zueinander passen. [S: `jb.js:2344–2787`]
+
+Die lokale API im `jb.js` setzt sich aus `steer`, `kread32`, `kwrite32`, `read8` und `write8` zusammen. 64-Bit-Zugriffe werden aus zwei 32-Bit-Operationen aufgebaut. Mehrere Selbsttests lesen erwartete Werte aus Kernelimage und Kernel-Heap, schreiben Testmuster in ausgewählte Stellen und stellen deren alten Inhalt wieder her. Nur wenn alle fünf Tests bestehen, startet der Endpfad. Das Wort „arbitrary“ im Programmlog beschreibt die beabsichtigte Adressierbarkeit; aus statischer Analyse kann ich nicht beweisen, dass **jede** Adresse ohne Seiteneffekt oder Fault les- oder schreibbar ist. [S: `jb.js:2789–2953`]
+
+## 9. Jailbreak, Kernel-Patch und Payload
+
+Im Jailbreak-Zweig ermittelt der Code über Thread und Prozess die eigene Credential- und Dateideskriptorstruktur, liest Ausgangswerte und prüft Kernelzeiger. Er verändert UID-/GID-bezogene Felder, Capability-Felder, die Prison-Referenz sowie Verzeichnisbezüge; danach vergleicht er UID, Rücklesewerte und Dateizugriff vor und nach der Änderung. Die referenzierten Prison- und Vnode-Werte sind aus dem Firmwareprofil beziehungsweise der Kernelbasis abgeleitet. Dieser Zweig beeinflusst die Isolation und Rechte **des Browserprozesses**. [S: `jb.js:3070–3290`]
+
+Die Patchphase lädt einen firmwarebezogenen Blob, sucht darin Patchstellen nach einem Byte-Muster, prüft einen ausführbaren Mapping-Pfad und kopiert den Blob mit Rückvergleich. Anschließend verändert sie kurzzeitig einen `sysent`-Eintrag, ruft den so erreichbaren Kernel-Ausführungspfad auf und stellt den ursprünglichen Eintrag in `finally` wieder her. Der Code kontrolliert Rückgabewert, Patchbytes und Restaurierung des `sysent`-Eintrags. Was der Blob darüber hinaus intern tut, ist ohne dessen Quelltext oder eine gesonderte Binäranalyse offen. [S: `jb.js:2992–3017, 3295–3470`]
+
+Nur nach erfolgreich gemeldeter Patchphase lädt der normale Pfad die größere Payload in einen ausführbaren Userland-Speicherbereich, vergleicht die kopierten Bytes und startet ihren Einstiegspunkt über einen nativen Threadaufruf. Der Erfolgstest betrachtet Rückgabewert und Threadhandle; er beweist nicht, dass sämtliche späteren Funktionen der Payload korrekt laufen. Der Wiederanlaufpfad bei einem schon veränderten Kernel verwendet einen ähnlichen Threadstart ohne erneute Race- und Patchphase. [S: `jb.js:543–625, 3473–3559`]
+
+## 10. Aufräumen und persistente Nebenwirkungen
+
+Der Code versucht, die Credential- und Verzeichnisbezüge des Browserprozesses wiederherzustellen, den betroffenen Worker-Credential-Zeiger zu prüfen, AIO-Anfragen zu terminieren, Sockets zu neutralisieren, Dateideskriptoren zu schließen, die CPU-Affinität zurückzusetzen und den manipulierten Funktionszeiger im Browser zu restaurieren. Diese Schritte sind über mehrere Kontrollpfade verteilt; eine Ausnahme oder ein Kernel-Fault kann sie unterbrechen. Worker werden bewusst nicht normal beendet, wenn beschädigte Thread-/Prozessbezüge befürchtet werden. [S: `jb.js:3559–3867`]
+
+Eine konkret sichtbare Kontrollfluss-Unstimmigkeit: Bei `keepjb=1` registriert der Code eine Rückstellung beim `pagehide` und protokolliert, der Jailbreak bleibe zunächst aktiv. Der äußere `finally`-Block ruft `jbRestoreHook("finally")` jedoch **ohne Prüfung von `KEEP_JB`** auf. Bei normalem Funktionsende werden die gespeicherten Prozessbezüge somit bereits dort zurückgeschrieben. Das heißt nicht, dass Kernel-Patches ebenfalls zurückgesetzt werden: Der Code selbst meldet Kernel-`.data`-/`.text`-Änderungen und Capability-Reste als bis zum Neustart verbleibend. [S: `jb.js:3583–3618, 3716–3754, 3826–3832`]
+
+## 11. Beobachtbarkeit, Prüfungen und Grenzen
+
+- `check()` zählt bestandene und fehlgeschlagene Prüfpunkte, doch nicht jeder Aufruf bestimmt den Kontrollfluss. Beispielsweise wird ein Ergebnis zur Form des rekonstruierten Zeigers und eine Duplikatprobe protokolliert, ohne an dieser Stelle zwingend abzubrechen. Der Abschlusszähler ist daher kein alleiniger Erfolgsbeweis. [S: `jb.js:100–109, 1955–1965, 2209–2223, 3856–3865`]
+- `mark()` sendet detaillierte Tags und Rohdaten per `XMLHttpRequest` an `/t`. Dieses Serverziel ist **nicht** im Archiv implementiert. Wenn ein Host es bereitstellt, können Logs einschließlich Laufzeitadressen an diesen Host übertragen werden. Die sichtbare Seite zeigt das volle Log nur mit `log=1`; `verbose=1` beeinflusst die Kürzung der Anzeigenachrichten, nicht die grundsätzliche Existenz der POSTs. [S: `jb.js:15–109`]
+- Der Code führt `mmap`-Kopien der Binärdateien mit Bytevergleich aus, aber es gibt keine eingebettete kryptografische Authentisierung der zur Laufzeit von der Web-Origin gelieferten Binärantwort. Das Cache-Manifest enthält SHA-256-Hexwerte als **Kommentare**. Alle darin genannten Datei-Hashes stimmen mit den Bytes dieses ZIPs überein; der Application Cache wertet diese Kommentare jedoch nicht als Integritätsprüfung aus. [S: `cache.appcache`, `jb.js:2992–3045, 3321–3350, 3473–3525`]
+- `payload2.bin` und `goldhen.bin` haben im vorliegenden ZIP dieselben 293120 Bytes und denselben SHA-256 `df3f27c1b35bc7c40e3a08caab948930914dc7d0301a73b68945cf6ffe40ea12`. Die Dateinamen und Kommentare im Profil allein belegen keine unterschiedliche Funktion. [S: Archivdateien, `ps4_offsets.js:538, 565–566`]
+- Der Quelltext enthält firmwarebezogene Statusmeldungen wie „HW-PROVEN“, „UNTESTED“ und „MEASURED“. Sie sind Angaben der Repositoryautoren. Diese Analyse kann weder die Fehlerursache einer bestimmten Systemversion noch den tatsächlichen Hardwareerfolg bestätigen. [S: `ps4_offsets.js:45–645`]
+- Das ZIP enthält keinen Server, keine `/t`-Implementierung, keine Buildanleitung für die Patch-Blobs und keine Testumgebung. Daher bleibt offen, ob die ausgelieferte Seite ohne zusätzliche Hostingkonfiguration alle Netzwerk- und Cachepfade wie beabsichtigt bedient. [S: Archivinhalt, `jb.js:15–28`]
+
+## 12. Vertrauensgrenzen für eine Sicherheitsreview
+
+Die kritischen Annahmen liegen in vier Schichten: **JSC-Objektlayout** (`core.js`, `mem.js`), **native Gadget- und Stubpositionen** (`ps4_offsets.js`, `jb.js`), **Kernel-Allokator und AIO-Lebensdauer** (`jb.js`-Race) sowie **Kernelobjektlayout und OID-Rechte** (`jb.js`-Orakel, R/W, Jailbreak). Ein Fehler in einer Schicht kann Datenfehler, Hänger oder einen Kernel-Fault statt eines sauberen Abbruchs erzeugen. Besonders wichtig für defensive Forschung sind Lebensdauer und Referenzzählung der AIO-Anfragen, die Freigabe/Wiederbelegung gleich großer IPv6-Objekte, die Validierung von User-Pointern und die Trennung zwischen einer gebundenen `sysctl`-OID und einem frei steuerbaren `arg1`-Zeiger. [S: `core.js:758–1068`, `jb.js:808–1965, 2558–2953, 3070–3618`]
+
+**Analytisches Ergebnis:** Das Repository implementiert erkennbar einen Browser-Exploit mit anschließender Kernel-Eskalationskette und einem späteren Patch-/Payload-Pfad. Die entscheidende Architektur ist der Übergang von einer experimentellen, begrenzten Kernel-Dekrementwirkung zu einer über Kernel-Datenstrukturen umgeleiteten `sysctl`-Schnittstelle. Die konkreten Hardware-Erfolgsbehauptungen sowie der vollständige Effekt der undokumentierten Binärdateien bleiben außerhalb des mitgelieferten Quelltextbelegs.
+
+## 13. Prüfung dieser Dokumentation
+
+Das ZIP wurde erfolgreich mit `unzip -t` geprüft. Alle sechs JavaScript-Dateien bestanden einen reinen Syntaxcheck mit `node --check`. Die im Cache-Manifest kommentierten SHA-256-Werte wurden gegen die im ZIP enthaltenen Dateien verglichen und stimmten überein. Diese Prüfungen führen die Webseite und die Binär-Payloads **nicht** aus und ersetzen keine Laufzeitanalyse auf einem isolierten Testsystem.
+
+**Quellennotation:** `[S: datei:erste–letzte Zeile]` bezeichnet Zeilen in den unveränderten Dateien des bereitgestellten Archivs. Die Zeilennummern sind für genau diesen ZIP-Stand bestimmt.
